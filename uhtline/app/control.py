@@ -46,6 +46,19 @@ ACTION_LATCHES: dict[str, tuple[str, ...]] = {
     "cip-pump-start": (latch_names.CIP_ALARM,),
 }
 
+# The stage each action really runs in; the preview must match the live check.
+ACTION_STAGES: dict[str, Stage] = {
+    "receive": Stage.INTAKE,
+    "balance-charge": Stage.INTAKE,
+    "preheat-persist": Stage.BALANCE,
+    "sterilization-ramp": Stage.PREHEAT,
+    "sterilization-confirm": Stage.STERILIZE,
+    "hold-start": Stage.STERILIZE,
+    "cooling-start": Stage.HOLD,
+    "aseptic-fill": Stage.COOL,
+    "batch-complete": Stage.ASEPTIC_FILL,
+}
+
 
 class LineControl:
     """Sequences the sections, publishes decisions and owns the record stream."""
@@ -105,8 +118,6 @@ class LineControl:
         self.timeline = timeline
         self.window = WindowDecision(config.temperature)
         self.metrics = metrics
-        self._permit_cache = {"gates": dict(gates.state()), "latches": dict(latches.state())}
-        self._records_cache = events.state().as_dict()
 
     # -- helpers -----------------------------------------------------------
 
@@ -517,6 +528,7 @@ class LineControl:
 
     def state_digest(self) -> dict[str, Any]:
         return {
+            "stage": self.stages.current().value,
             "watermark": self.events.watermark(),
             "balance_litres": self.balance.level_litres(),
             "aseptic_litres": self.aseptic.volume_litres(),
@@ -527,7 +539,7 @@ class LineControl:
         }
 
     def health(self) -> dict[str, Any]:
-        stream = self._records_cache
+        stream = self.events.state().as_dict()
         self.metrics.gauge("records.watermark", float(stream.get("watermark", 0)))
         self.metrics.gauge("alarms.active", self.alarms.counts()["active"])
         return {
@@ -558,17 +570,27 @@ class LineControl:
             "aseptic": self.aseptic.snapshot(),
             "cleaning": self.cip.snapshot(),
             "gates": self.gates.inventory(),
-            "latches": self.latches.state(),
+            "latches": self.latches.inventory(),
+            "records": self.events.state().as_dict(),
+            "generations": self.generations.as_dict(),
+            "warranties": self.warranties.inventory(),
+            "decisions": self.decisions.counts(),
             "timeline": self.timeline.snapshot(),
         }
 
     def precheck(self, action: str) -> dict[str, Any]:
-        """Read-only preview of the permits an action would need."""
+        """Read-only preview of the permits an action would need.
+
+        The preview reads the live gate, latch and stage state, so it cannot
+        disagree with the checks the action performs when it is submitted.
+        """
 
         required_gates = ACTION_GATES.get(action, ())
         required_latches = ACTION_LATCHES.get(action, ())
-        gates = self._permit_cache["gates"]
-        latches = self._permit_cache["latches"]
+        required_stage = ACTION_STAGES.get(action)
+        gates = self.gates.state()
+        latches = self.latches.state()
+        current_stage = self.stages.current()
         blockers: list[dict[str, Any]] = [
             {"kind": "gate", "name": name, "state": gates.get(name, "closed")}
             for name in required_gates
@@ -579,10 +601,19 @@ class LineControl:
             for name in required_latches
             if latches.get(name, False)
         )
+        if required_stage is not None and current_stage is not required_stage:
+            blockers.append(
+                {
+                    "kind": "stage",
+                    "expected": required_stage.value,
+                    "state": current_stage.value,
+                }
+            )
         return {
             "action": str(action),
             "permitted": not blockers,
-            "stage": self.stages.current().value,
+            "stage": current_stage.value,
+            "required_stage": None if required_stage is None else required_stage.value,
             "required_gates": list(required_gates),
             "required_latches": list(required_latches),
             "blockers": blockers,
@@ -638,4 +669,4 @@ class LineControl:
         }
 
 
-__all__ = ["ACTION_GATES", "ACTION_LATCHES", "LineControl"]
+__all__ = ["ACTION_GATES", "ACTION_LATCHES", "ACTION_STAGES", "LineControl"]

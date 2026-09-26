@@ -45,7 +45,6 @@ class ConsoleApp:
     def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
         self.control = runtime.control
-        self._stream_cache = runtime.control.stream_state()
         self.router = Router()
         self._log_lines: list[str] = []
         self._register_routes()
@@ -149,6 +148,7 @@ class ConsoleApp:
 
     def _health(self, params: dict[str, str], query: dict[str, str], body: dict[str, Any]) -> Any:
         payload = self.control.health()
+        payload["recovery"] = self.runtime.recovery_report()
         payload["routes"] = self.router.count()
         return payload
 
@@ -176,11 +176,11 @@ class ConsoleApp:
 
     def _records(self, params: dict[str, str], query: dict[str, str], body: dict[str, Any]) -> Any:
         if query.get("pending") in {"1", "true", "yes"}:
-            return {"pending": self.control.pending_records(), "state": self._stream_cache}
+            return {"pending": self.control.pending_records(), "state": self.control.stream_state()}
         limit = int(query.get("limit", 50))
         kind = query.get("kind")
         records = self.control.visible_records(limit) if kind is None else self.control.records_of_kind(kind)
-        return {"visible": records[-limit:], "state": self._stream_cache}
+        return {"visible": records[-limit:], "state": self.control.stream_state()}
 
     def _decisions(self, params: dict[str, str], query: dict[str, str], body: dict[str, Any]) -> Any:
         return {
