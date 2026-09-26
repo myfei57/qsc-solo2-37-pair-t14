@@ -46,6 +46,11 @@ ACTION_LATCHES: dict[str, tuple[str, ...]] = {
     "cip-pump-start": (latch_names.CIP_ALARM,),
 }
 
+ACTION_STAGES: dict[str, Stage] = {
+    "sterilization-ramp": Stage.PREHEAT,
+    "aseptic-fill": Stage.COOL,
+}
+
 
 class LineControl:
     """Sequences the sections, publishes decisions and owns the record stream."""
@@ -105,8 +110,6 @@ class LineControl:
         self.timeline = timeline
         self.window = WindowDecision(config.temperature)
         self.metrics = metrics
-        self._permit_cache = {"gates": dict(gates.state()), "latches": dict(latches.state())}
-        self._records_cache = events.state().as_dict()
 
     # -- helpers -----------------------------------------------------------
 
@@ -517,6 +520,7 @@ class LineControl:
 
     def state_digest(self) -> dict[str, Any]:
         return {
+            "stage": self.stages.current().value,
             "watermark": self.events.watermark(),
             "balance_litres": self.balance.level_litres(),
             "aseptic_litres": self.aseptic.volume_litres(),
@@ -527,7 +531,7 @@ class LineControl:
         }
 
     def health(self) -> dict[str, Any]:
-        stream = self._records_cache
+        stream = self.events.state().as_dict()
         self.metrics.gauge("records.watermark", float(stream.get("watermark", 0)))
         self.metrics.gauge("alarms.active", self.alarms.counts()["active"])
         return {
@@ -535,6 +539,7 @@ class LineControl:
             "line_code": self.config.line_code,
             "stage": self.stages.current().value,
             "records": dict(stream),
+            "recovery": self.recovery_report(),
             "audit_entries": self.audit.size(),
             "audit_valid": self.audit.verify()["valid"],
             "alarms": self.alarms.counts(),
@@ -542,6 +547,28 @@ class LineControl:
             "active_latches": self.latches.active(),
             "gates": self.gates.state(),
             "metrics": self.metrics.snapshot(),
+        }
+
+    def recovery_report(self) -> dict[str, Any]:
+        """Validate every durable document and report the recovered line state."""
+
+        documents = self.store.inventory()
+        invalid = [item for item in documents if not item["valid"]]
+        stream = self.events.state()
+        audit = self.audit.verify()
+        return {
+            "data_root": str(self.store.root),
+            "documents": len(documents),
+            "invalid_documents": len(invalid),
+            "journals": self.store.journal_names(),
+            "audit_valid": audit["valid"],
+            "audit_entries": audit["entries"],
+            "watermark": stream.watermark,
+            "pending_records": stream.pending,
+            "visible_records": stream.visible,
+            "stage": self.stages.current().value,
+            "sensors": [sensor.sensor_id for sensor in self.thermometry.sensors()],
+            "valid": not invalid and bool(audit["valid"]),
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -558,17 +585,28 @@ class LineControl:
             "aseptic": self.aseptic.snapshot(),
             "cleaning": self.cip.snapshot(),
             "gates": self.gates.inventory(),
-            "latches": self.latches.state(),
+            "latches": self.latches.inventory(),
+            "records": self.events.state().as_dict(),
+            "generations": self.generations.as_dict(),
+            "warranties": {"states": self.warranties.state_counts(), "inventory": self.warranties.inventory()},
+            "decisions": self.decisions.counts(),
             "timeline": self.timeline.snapshot(),
         }
 
     def precheck(self, action: str) -> dict[str, Any]:
-        """Read-only preview of the permits an action would need."""
+        """Read-only preview of the permits an action would need.
+
+        Every check here reads the live boards and mirrors the same gates,
+        latches and stage the real action enforces, so a green preview cannot
+        be refused when the button is pressed.
+        """
 
         required_gates = ACTION_GATES.get(action, ())
         required_latches = ACTION_LATCHES.get(action, ())
-        gates = self._permit_cache["gates"]
-        latches = self._permit_cache["latches"]
+        required_stage = ACTION_STAGES.get(action)
+        gates = self.gates.state()
+        latches = self.latches.state()
+        current_stage = self.stages.current().value
         blockers: list[dict[str, Any]] = [
             {"kind": "gate", "name": name, "state": gates.get(name, "closed")}
             for name in required_gates
@@ -579,10 +617,19 @@ class LineControl:
             for name in required_latches
             if latches.get(name, False)
         )
+        if required_stage is not None and current_stage != required_stage.value:
+            blockers.append(
+                {
+                    "kind": "stage",
+                    "expected": required_stage.value,
+                    "stage": current_stage,
+                }
+            )
         return {
             "action": str(action),
             "permitted": not blockers,
-            "stage": self.stages.current().value,
+            "stage": current_stage,
+            "required_stage": None if required_stage is None else required_stage.value,
             "required_gates": list(required_gates),
             "required_latches": list(required_latches),
             "blockers": blockers,

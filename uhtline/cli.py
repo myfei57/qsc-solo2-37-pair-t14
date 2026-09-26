@@ -117,9 +117,7 @@ def main(argv: Sequence[str] | None = None, *, server_factory: type[ConsoleServe
         return _run_server(args, runtime, args.quiet, server_factory)
     if command == "status":
         if args.health:
-            payload = control.health()
-            payload["recovery"] = runtime.recovery_report()
-            _json_print(payload)
+            _json_print(control.health())
         elif args.recovery:
             _json_print(runtime.recovery_report())
         else:

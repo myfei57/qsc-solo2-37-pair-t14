@@ -116,24 +116,7 @@ class Runtime:
         return self.store.backup(Path(destination))
 
     def recovery_report(self) -> dict[str, Any]:
-        documents = self.store.inventory()
-        invalid = [item for item in documents if not item["valid"]]
-        stream = self.events.state()
-        audit = self.audit.verify()
-        return {
-            "data_root": str(self.store.root),
-            "documents": len(documents),
-            "invalid_documents": len(invalid),
-            "journals": self.store.journal_names(),
-            "audit_valid": audit["valid"],
-            "audit_entries": audit["entries"],
-            "watermark": stream.watermark,
-            "pending_records": stream.pending,
-            "visible_records": stream.visible,
-            "stage": self.stages.current().value,
-            "sensors": [sensor.sensor_id for sensor in self.thermometry.sensors()],
-            "valid": not invalid and bool(audit["valid"]),
-        }
+        return self.control.recovery_report()
 
 
 def _define_equipment(gates: GateBoard, latches: LatchBoard) -> None:
